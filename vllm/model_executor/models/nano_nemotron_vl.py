@@ -951,10 +951,20 @@ class NemotronH_Nano_VL_V2(
         llm_dtype = self.language_model.config.dtype
         assert isinstance(llm_dtype, torch.dtype)
         self.llm_dtype = llm_dtype
+        quant_config = vllm_config.quant_config
         with self._mark_tower_model(vllm_config, {"image", "video", "audio"}):
-            self.vision_model = self.get_vit_model_from_radio_config(config).to(
-                llm_dtype
+            vision_model = self.get_vit_model_from_radio_config(
+                config, quant_config=quant_config
             )
+            # Skip .to(llm_dtype) when quantized: FP8 weights must stay
+            # float8_e4m3fn and their scales must stay float32, but a
+            # blanket dtype cast corrupts both. The FP8 linear layers already
+            # emit outputs in torch.get_default_dtype() (BF16), and
+            # extract_feature explicitly casts vit_embeds to bfloat16 after
+            # the encoder runs, so dtype consistency is preserved.
+            if quant_config is None:
+                vision_model = vision_model.to(llm_dtype)
+            self.vision_model = vision_model
 
             # Construct the vision projection.
             vit_hidden_size = config.vit_hidden_size
@@ -1525,6 +1535,11 @@ class NemotronH_Nano_VL_V2(
             elif is_adapter_weights((name, w)):
                 # Load vision-language adapter weights directly
                 trimmed_name = ".".join(name.split(".")[1:])
+                if trimmed_name not in adapter_dict:
+                    # FP8-quantized checkpoints include input_scale / weight_scale
+                    # tensors alongside each linear weight. mlp1 runs in BF16 in
+                    # vLLM so these scales are not registered parameters — skip them.
+                    continue
                 param = adapter_dict[trimmed_name]
                 with torch.no_grad():
                     default_weight_loader(param, w)
@@ -1541,7 +1556,7 @@ class NemotronH_Nano_VL_V2(
         if self.sound_encoder is not None and len(sound_weights) > 0:
             self.sound_encoder.load_weights(sound_weights)
 
-    def get_vit_model_from_radio_config(self, hf_config):
+    def get_vit_model_from_radio_config(self, hf_config, quant_config=None):
         hf_config_vision = hf_config.vision_config
         model_name = hf_config_vision.args.get("model")
         if model_name is None:
@@ -1571,7 +1586,7 @@ class NemotronH_Nano_VL_V2(
             **hf_config_vision.args,
         )
 
-        return RadioModel(config=radio_config)
+        return RadioModel(config=radio_config, quant_config=quant_config)
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(
